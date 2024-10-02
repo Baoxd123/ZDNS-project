@@ -15,6 +15,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
+const BatchSize = 100 // 设置批处理大小
+
 // ZDNS query result structure
 type ZDNSResult struct {
 	Name    string `json:"name"`
@@ -50,35 +52,52 @@ func initMongoDB() {
 	zdnsCollection = client.Database("ssl_project").Collection("zdns_results")
 }
 
-// Handle received domain and query through ZDNS
-func handleDomain(domain string) {
+// 批量处理域名查询
+func handleBatch(domains []string) {
+	// 使用 ZDNS 批量查询命令
 	cmd := exec.Command("zdns", "A")
-	cmd.Stdin = strings.NewReader(domain)
+	cmd.Stdin = strings.NewReader(strings.Join(domains, "\n")) // 将所有域名加入到 ZDNS 查询中
 	out, err := cmd.Output()
 	if err != nil {
-		storeResult(time.Now().Format(time.RFC3339), domain, "None")
+		log.Printf("ZDNS batch query failed: %v", err)
+		storeBatchResults(time.Now().Format(time.RFC3339), domains, []string{"None"})
 		return
 	}
 
-	var result ZDNSResult
-	if err := json.Unmarshal(out, &result); err != nil {
-		storeResult(time.Now().Format(time.RFC3339), domain, "None")
-		return
-	}
-
-	if result.Results.A.Status != "NOERROR" {
-		storeResult(result.Results.A.Timestamp, domain, "None")
-		return
-	}
-
-	if len(result.Results.A.Data.Answers) > 0 {
-		for _, answer := range result.Results.A.Data.Answers {
-			if answer.Type == "A" {
-				storeResult(result.Results.A.Timestamp, domain, answer.Address)
-			}
+	// 逐行解析 ZDNS 输出
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue // 跳过空行
 		}
-	} else {
-		storeResult(result.Results.A.Timestamp, domain, "None")
+
+		var result ZDNSResult
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			log.Printf("Failed to unmarshal ZDNS result: %v", err)
+			continue
+		}
+
+		// 检查并存储结果
+		if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
+			for _, answer := range result.Results.A.Data.Answers {
+				if answer.Type == "A" {
+					storeResult(result.Results.A.Timestamp, result.Name, answer.Address)
+				}
+			}
+		} else {
+			storeResult(time.Now().Format(time.RFC3339), result.Name, "None")
+		}
+	}
+}
+
+// 将批处理结果存储到 MongoDB
+func storeBatchResults(timestamp string, domains []string, ips []string) {
+	for i := 0; i < len(domains); i++ {
+		ip := "None"
+		if i < len(ips) {
+			ip = ips[i]
+		}
+		storeResult(timestamp, domains[i], ip)
 	}
 }
 
@@ -96,13 +115,32 @@ func storeResult(timestamp, domain, ip string) {
 	}
 }
 
-// Worker function to process messages
+// Worker function to process messages in batches
 func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 	defer wg.Done()
+
+	// 初始化缓冲区和计数器
+	var domains []string
+	counter := 0
+
 	for msg := range jobs {
 		domain := string(msg.Body)
-		handleDomain(domain)
+		domains = append(domains, domain)
+		counter++
+
+		// 如果缓冲区达到批处理大小，则执行 ZDNS 批量查询
+		if counter >= BatchSize {
+			handleBatch(domains)
+			domains = nil // 清空缓冲区
+			counter = 0   // 重置计数器
+		}
+
 		msg.Finish()
+	}
+
+	// 处理剩余的消息
+	if counter > 0 {
+		handleBatch(domains)
 	}
 }
 
@@ -116,7 +154,7 @@ func main() {
 	}()
 
 	// Number of worker goroutines
-	numWorkers := 200
+	numWorkers := 20
 
 	// Create NSQ consumer
 	config := nsq.NewConfig()
