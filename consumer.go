@@ -15,7 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-const BatchSize = 100 // 设置批处理大小
+const BatchSize = 100 // Set batch size
 
 // ZDNS query result structure
 type ZDNSResult struct {
@@ -52,11 +52,11 @@ func initMongoDB() {
 	zdnsCollection = client.Database("ssl_project").Collection("zdns_results")
 }
 
-// 批量处理域名查询
+// Process domain queries in batches
 func handleBatch(domains []string) {
-	// 使用 ZDNS 批量查询命令
+	// Use ZDNS batch query command
 	cmd := exec.Command("zdns", "A")
-	cmd.Stdin = strings.NewReader(strings.Join(domains, "\n")) // 将所有域名加入到 ZDNS 查询中
+	cmd.Stdin = strings.NewReader(strings.Join(domains, "\n")) // Add all domains to the ZDNS query
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("ZDNS batch query failed: %v", err)
@@ -64,11 +64,11 @@ func handleBatch(domains []string) {
 		return
 	}
 
-	// 逐行解析 ZDNS 输出
+	// Parse ZDNS output line by line
 	lines := strings.Split(string(out), "\n")
 	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
-			continue // 跳过空行
+			continue // Skip empty lines
 		}
 
 		var result ZDNSResult
@@ -77,7 +77,7 @@ func handleBatch(domains []string) {
 			continue
 		}
 
-		// 检查并存储结果
+		// Check and store results
 		if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
 			for _, answer := range result.Results.A.Data.Answers {
 				if answer.Type == "A" {
@@ -90,7 +90,7 @@ func handleBatch(domains []string) {
 	}
 }
 
-// 将批处理结果存储到 MongoDB
+// Store batch results in MongoDB
 func storeBatchResults(timestamp string, domains []string, ips []string) {
 	for i := 0; i < len(domains); i++ {
 		ip := "None"
@@ -119,7 +119,7 @@ func storeResult(timestamp, domain, ip string) {
 func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// 初始化缓冲区和计数器
+	// Initialize buffer and counter
 	var domains []string
 	counter := 0
 
@@ -128,17 +128,17 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 		domains = append(domains, domain)
 		counter++
 
-		// 如果缓冲区达到批处理大小，则执行 ZDNS 批量查询
+		// If the buffer reaches the batch size, execute ZDNS batch query
 		if counter >= BatchSize {
 			handleBatch(domains)
-			domains = nil // 清空缓冲区
-			counter = 0   // 重置计数器
+			domains = nil // Clear buffer
+			counter = 0   // Reset counter
 		}
 
 		msg.Finish()
 	}
 
-	// 处理剩余的消息
+	// Process remaining messages
 	if counter > 0 {
 		handleBatch(domains)
 	}
