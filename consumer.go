@@ -53,14 +53,23 @@ func initMongoDB() {
 }
 
 // Process domain queries in batches
-func handleBatch(domains []string) {
+func handleBatch(domains []string, recordIDs []string) {
+	// Create a map to store domain and recordID relationships
+	domainMap := make(map[string]string)
+	for i, domain := range domains {
+		domainMap[domain] = recordIDs[i]
+	}
+
 	// Use ZDNS batch query command
 	cmd := exec.Command("zdns", "A")
 	cmd.Stdin = strings.NewReader(strings.Join(domains, "\n")) // Add all domains to the ZDNS query
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("ZDNS batch query failed: %v", err)
-		storeBatchResults(time.Now().Format(time.RFC3339), domains, []string{"None"})
+		// Store failure for all domains
+		for domain, recordID := range domainMap {
+			storeResult(time.Now().Format(time.RFC3339), domain, "Batch Query Failed", recordID)
+		}
 		return
 	}
 
@@ -74,41 +83,48 @@ func handleBatch(domains []string) {
 		var result ZDNSResult
 		if err := json.Unmarshal([]byte(line), &result); err != nil {
 			log.Printf("Failed to unmarshal ZDNS result: %v", err)
+			// Even if unmarshaling fails, store the failure info with correct record ID
+			if recordID, exists := domainMap[result.Name]; exists {
+				storeResult(time.Now().Format(time.RFC3339), result.Name, "Unmarshal Error", recordID)
+			}
 			continue
 		}
 
 		// Check and store results
-		if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
-			for _, answer := range result.Results.A.Data.Answers {
-				if answer.Type == "A" {
-					storeResult(result.Results.A.Timestamp, result.Name, answer.Address)
+		if recordID, exists := domainMap[result.Name]; exists {
+			if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
+				for _, answer := range result.Results.A.Data.Answers {
+					if answer.Type == "A" {
+						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID)
+					}
 				}
+			} else {
+				storeResult(result.Results.A.Timestamp, result.Name, result.Results.A.Status, recordID)
 			}
-		} else {
-			storeResult(time.Now().Format(time.RFC3339), result.Name, "None")
 		}
 	}
 }
 
 // Store batch results in MongoDB
-func storeBatchResults(timestamp string, domains []string, ips []string) {
+func storeBatchResults(timestamp string, domains []string, recordIDs []string, ips []string) {
 	for i := 0; i < len(domains); i++ {
 		ip := "None"
 		if i < len(ips) {
 			ip = ips[i]
 		}
-		storeResult(timestamp, domains[i], ip)
+		storeResult(timestamp, domains[i], ip, recordIDs[i])
 	}
 }
 
 // Store result in MongoDB and print
-func storeResult(timestamp, domain, ip string) {
-	fmt.Printf("<%s, %s, %s>\n", timestamp, domain, ip)
+func storeResult(timestamp, domain, ip, recordID string) {
+	fmt.Printf("<%s, %s, %s, %s>\n", timestamp, domain, ip, recordID)
 
 	_, err := zdnsCollection.InsertOne(context.Background(), map[string]interface{}{
 		"timestamp": timestamp,
 		"domain":    domain,
 		"ip":        ip,
+		"record_ID": recordID,
 	})
 	if err != nil {
 		log.Printf("Failed to insert into MongoDB: %s", err)
@@ -121,18 +137,33 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 
 	// Initialize buffer and counter
 	var domains []string
+	var recordIDs []string
 	counter := 0
 
 	for msg := range jobs {
-		domain := string(msg.Body)
+		// Parse the JSON message to extract domain and record_ID
+		var messageData struct {
+			RecordID string `json:"record_ID"`
+			Domain   string `json:"domain"`
+		}
+		if err := json.Unmarshal(msg.Body, &messageData); err != nil {
+			log.Printf("Failed to unmarshal NSQ message: %v", err)
+			msg.Finish()
+			continue
+		}
+
+		domain := messageData.Domain
+		recordID := messageData.RecordID
 		domains = append(domains, domain)
+		recordIDs = append(recordIDs, recordID)
 		counter++
 
 		// If the buffer reaches the batch size, execute ZDNS batch query
 		if counter >= BatchSize {
-			handleBatch(domains)
-			domains = nil // Clear buffer
-			counter = 0   // Reset counter
+			handleBatch(domains, recordIDs)
+			domains = nil   // Clear buffer
+			recordIDs = nil // Clear record IDs buffer
+			counter = 0     // Reset counter
 		}
 
 		msg.Finish()
@@ -140,7 +171,7 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 
 	// Process remaining messages
 	if counter > 0 {
-		handleBatch(domains)
+		handleBatch(domains, recordIDs)
 	}
 }
 
