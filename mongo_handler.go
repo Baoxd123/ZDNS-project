@@ -28,18 +28,18 @@ func InitMongoDB() {
 	zdnsCollection = client.Database("ssl_project").Collection("zdns_results")
 }
 
-func StoreCertstreamResult(domain string) {
-	_, err := certstreamCollection.InsertOne(context.Background(), map[string]interface{}{
-		"domain":    domain,
-		"timestamp": time.Now(),
-	})
+func StoreCertstreamResult(certData map[string]interface{}) {
+	_, err := certstreamCollection.InsertOne(context.Background(), certData)
+	log.Printf("Storing certData: %v", certData)
+
 	if err != nil {
 		log.Printf("Failed to insert into MongoDB: %s", err)
 	}
 }
 
-func StoreZDNSResult(timestamp, domain, ip string) {
+func StoreZDNSResult(timestamp, domain, ip string, record_ID string) {
 	_, err := zdnsCollection.InsertOne(context.Background(), map[string]interface{}{
+		"record_ID": record_ID,
 		"timestamp": timestamp,
 		"domain":    domain,
 		"ip":        ip,
