@@ -1,159 +1,245 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
+	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/CaliDog/certstream-go"
 	"github.com/nsqio/go-nsq"
-	"github.com/xingda/ssl_mongo_project"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-var logger = log.New(log.Writer(), "certstream-example: ", log.Lshortfile)
+const BatchSize = 100 // Set batch size
 
-// Map to keep track of domain counts per second
-var domainCountMap = make(map[string]int)
-var mu sync.Mutex
+// ZDNS query result structure
+type ZDNSResult struct {
+	Name    string `json:"name"`
+	Results struct {
+		A struct {
+			Data struct {
+				Answers []struct {
+					Address string `json:"answer"`
+					Type    string `json:"type"`
+				} `json:"answers"`
+			} `json:"data"`
+			Status    string `json:"status"`
+			Timestamp string `json:"timestamp"`
+		} `json:"A"`
+	} `json:"results"`
+}
 
-// Publish domain information to NSQ with record_ID
-func publishToNSQ(recordID, domain string, producer *nsq.Producer) {
-	// Create a JSON object with record_ID and domain
-	message := map[string]string{
-		"record_ID": recordID,
-		"domain":    domain,
+var (
+	mongoClient    *mongo.Client
+	zdnsCollection *mongo.Collection
+)
+
+// Initialize MongoDB connection
+func initMongoDB() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	messageJSON, err := json.Marshal(message)
+	mongoClient = client
+	zdnsCollection = client.Database("ssl_project").Collection("zdns_results")
+}
+
+// Generate a random string of a given length
+func generateRandomString(length int) string {
+	letters := []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+	rand.Seed(time.Now().UnixNano())
+	b := make([]rune, length)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+// Process domain queries in batches
+func handleBatch(domains []string, recordIDs []string) {
+	// Create a map to store domain and recordID relationships
+	domainMap := make(map[string]string)
+	for i, domain := range domains {
+		// Replace wildcard (*) with a random string to avoid accidental matches
+		if strings.HasPrefix(domain, "*.") {
+			randomSubdomain := generateRandomString(10)
+			domain = strings.Replace(domain, "*", randomSubdomain, 1)
+		}
+		domainMap[domain] = recordIDs[i]
+		domains[i] = domain // Update the domains slice with the modified domain
+	}
+
+	// Use ZDNS batch query command
+	cmd := exec.Command("zdns", "A")
+	cmd.Stdin = strings.NewReader(strings.Join(domains, "\n")) // Add all domains to the ZDNS query
+	out, err := cmd.Output()
 	if err != nil {
-		logger.Printf("Failed to marshal message to JSON: %s", err)
+		log.Printf("ZDNS batch query failed: %v", err)
+		// Store failure for all domains
+		for originalDomain, recordID := range domainMap {
+			storeResult(time.Now().Format(time.RFC3339), originalDomain, "Batch Query Failed", recordID)
+		}
 		return
 	}
 
-	err = producer.Publish("domain_names", messageJSON)
-	if err != nil {
-		logger.Printf("Failed to publish domain to NSQ: %s", err)
-	} else {
-		logger.Printf("Successfully published domain to NSQ: %s", messageJSON)
+	// Parse ZDNS output line by line
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue // Skip empty lines
+		}
+
+		var result ZDNSResult
+		if err := json.Unmarshal([]byte(line), &result); err != nil {
+			log.Printf("Failed to unmarshal ZDNS result: %v", err)
+			// Even if unmarshaling fails, store the failure info with correct record ID
+			if recordID, exists := domainMap[result.Name]; exists {
+				storeResult(time.Now().Format(time.RFC3339), result.Name, "Unmarshal Error", recordID)
+			}
+			continue
+		}
+
+		// Check and store results
+		if recordID, exists := domainMap[result.Name]; exists {
+			if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
+				for _, answer := range result.Results.A.Data.Answers {
+					if answer.Type == "A" {
+						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID)
+					}
+				}
+			} else {
+				storeResult(result.Results.A.Timestamp, result.Name, result.Results.A.Status, recordID)
+			}
+		}
 	}
 }
 
-// Handle certificate update by extracting domains and publishing them to NSQ
-func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer) {
-	leafCert, ok := data["leaf_cert"].(map[string]interface{})
-	if !ok {
-		logger.Printf("Failed to get leaf_cert from JSON")
-		return
-	}
-
-	allDomains, ok := leafCert["all_domains"].([]interface{})
-	if !ok {
-		logger.Printf("Failed to get all_domains from leaf_cert")
-		return
-	}
-
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z") // Generate the current timestamp in second precision, in UTC
-
-	for _, domain := range allDomains {
-		domainStr, ok := domain.(string)
-		if ok {
-			logger.Printf("Extracted domain: %s", domainStr)
-
-			// Generate record_ID with counter if needed
-			mu.Lock()
-			key := fmt.Sprintf("%s_%s", timestamp, domainStr)
-			counter := domainCountMap[key] + 1
-			domainCountMap[key] = counter
-			mu.Unlock()
-
-			var recordID string
-			if counter == 1 {
-				recordID = fmt.Sprintf("%s_%s", timestamp, domainStr)
-			} else {
-				recordID = fmt.Sprintf("%s_%s_%d", timestamp, domainStr, counter)
-			}
-
-			// Publish to NSQ with record_ID and domain
-			publishToNSQ(recordID, domainStr, producer)
-
-			// Store the individual parts of the certificate in MongoDB along with the domain
-			extensions, _ := leafCert["extensions"].(map[string]interface{})
-			subject, _ := leafCert["subject"].(map[string]interface{})
-			issuer, _ := leafCert["issuer"].(map[string]interface{})
-
-			certData := map[string]interface{}{
-				"store_timestamp":             timestamp,
-				"record_ID":                   recordID,
-				"domain":                      domainStr,
-				"serial_number":               leafCert["serial_number"],
-				"issuer_country":              issuer["C"],
-				"issuer_common_name":          issuer["CN"],
-				"issuer_organization":         issuer["O"],
-				"issuer_organizational_unit":  issuer["OU"],
-				"subject_country":             subject["C"],
-				"subject_common_name":         subject["CN"],
-				"subject_organization":        subject["O"],
-				"subject_organizational_unit": subject["OU"],
-				"not_before":                  leafCert["not_before"],
-				"not_after":                   leafCert["not_after"],
-				"fingerprint":                 leafCert["fingerprint"],
-				"authority_info_access":       extensions["authorityInfoAccess"],
-				"subject_alternative_names":   extensions["subjectAltName"],
-				"basic_constraints":           extensions["basicConstraints"],
-				"key_usage":                   extensions["keyUsage"],
-				"extended_key_usage":          extensions["extendedKeyUsage"],
-				"certificate_policies":        extensions["certificatePolicies"],
-				"signature_algorithm":         leafCert["signature_algorithm"],
-			}
-
-			ssl_mongo_project.StoreCertstreamResult(certData)
-			logger.Printf("Stored full certstream result in MongoDB: %v", certData)
-
-		} else {
-			logger.Printf("Invalid domain type")
+// Store batch results in MongoDB
+func storeBatchResults(timestamp string, domains []string, recordIDs []string, ips []string) {
+	for i := 0; i < len(domains); i++ {
+		ip := "None"
+		if i < len(ips) {
+			ip = ips[i]
 		}
+		storeResult(timestamp, domains[i], ip, recordIDs[i])
+	}
+}
+
+// Store result in MongoDB and print
+func storeResult(timestamp, domain, ip, recordID string) {
+	fmt.Printf("<%s, %s, %s, %s>\n", timestamp, domain, ip, recordID)
+
+	_, err := zdnsCollection.InsertOne(context.Background(), map[string]interface{}{
+		"timestamp": timestamp,
+		"domain":    domain,
+		"ip":        ip,
+		"record_ID": recordID,
+	})
+	if err != nil {
+		log.Printf("Failed to insert into MongoDB: %s", err)
+	}
+}
+
+// Worker function to process messages in batches
+func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Initialize buffer and counter
+	var domains []string
+	var recordIDs []string
+	counter := 0
+
+	for msg := range jobs {
+		// Parse the JSON message to extract domain and record_ID
+		var messageData struct {
+			RecordID string `json:"record_ID"`
+			Domain   string `json:"domain"`
+		}
+		if err := json.Unmarshal(msg.Body, &messageData); err != nil {
+			log.Printf("Failed to unmarshal NSQ message: %v", err)
+			msg.Finish()
+			continue
+		}
+
+		domain := messageData.Domain
+		recordID := messageData.RecordID
+
+		domains = append(domains, domain)
+		recordIDs = append(recordIDs, recordID)
+		counter++
+
+		// If the buffer reaches the batch size, execute ZDNS batch query
+		if counter >= BatchSize {
+			handleBatch(domains, recordIDs)
+			domains = nil   // Clear buffer
+			recordIDs = nil // Clear record IDs buffer
+			counter = 0     // Reset counter
+		}
+
+		msg.Finish()
+	}
+
+	// Process remaining messages
+	if counter > 0 {
+		handleBatch(domains, recordIDs)
 	}
 }
 
 func main() {
-	ssl_mongo_project.InitMongoDB()
-
-	producer, err := nsq.NewProducer("127.0.0.1:4150", nsq.NewConfig())
-	if err != nil {
-		log.Fatal("Failed to create NSQ producer:", err)
-	}
-	defer producer.Stop()
-
-	stream, errStream := certstream.CertStreamEventStream(false)
-
-	for {
-		select {
-		case jq := <-stream:
-			logger.Printf("Full certstream message: %v", jq)
-			messageType, err := jq.String("message_type")
-			if err != nil {
-				logger.Fatal("Error decoding message type")
-			}
-
-			if messageType == "certificate_update" {
-				rawData, err := jq.Interface()
-				if err != nil {
-					logger.Printf("Failed to get interface from jq: %s", err)
-					continue
-				}
-
-				data, ok := rawData.(map[string]interface{})
-				if !ok {
-					logger.Printf("Failed to convert to map[string]interface{}")
-					continue
-				}
-				handleCertificateUpdate(data["data"].(map[string]interface{}), producer)
-			}
-
-		case err := <-errStream:
-			logger.Printf("Error from certstream: %s", err)
+	// Initialize MongoDB
+	initMongoDB()
+	defer func() {
+		if err := mongoClient.Disconnect(context.Background()); err != nil {
+			log.Fatal(err)
 		}
+	}()
+
+	// Number of worker goroutines
+	numWorkers := 20
+
+	// Create NSQ consumer
+	config := nsq.NewConfig()
+	config.MaxInFlight = numWorkers * 2 // Adjust this value as needed
+	consumer, err := nsq.NewConsumer("domain_names", "channel", config)
+	if err != nil {
+		log.Fatal("Failed to create NSQ consumer:", err)
 	}
+
+	// Create a channel to pass jobs to workers
+	jobs := make(chan *nsq.Message, numWorkers)
+
+	// Create a wait group to manage workers
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go worker(w, jobs, &wg)
+	}
+
+	// Handle messages received from NSQ
+	consumer.AddHandler(nsq.HandlerFunc(func(message *nsq.Message) error {
+		jobs <- message
+		return nil
+	}))
+
+	// Connect to nsqlookupd service
+	err = consumer.ConnectToNSQLookupd("127.0.0.1:4161")
+	if err != nil {
+		log.Fatal("Failed to connect to nsqlookupd:", err)
+	}
+
+	log.Printf("Started %d workers. Processing messages...\n", numWorkers)
+
+	// Wait for workers to finish (which they never will in this case)
+	wg.Wait()
 }
