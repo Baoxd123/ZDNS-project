@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/CaliDog/certstream-go"
@@ -12,6 +13,10 @@ import (
 )
 
 var logger = log.New(log.Writer(), "certstream-example: ", log.Lshortfile)
+
+// Map to keep track of domain counts per second
+var domainCountMap = make(map[string]int)
+var mu sync.Mutex
 
 // Publish domain information to NSQ with record_ID
 func publishToNSQ(recordID, domain string, producer *nsq.Producer) {
@@ -49,15 +54,26 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 		return
 	}
 
-	timestamp := time.Now().Format(time.RFC3339) // Generate the current timestamp
+	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z") // Generate the current timestamp in second precision, in UTC
 
 	for _, domain := range allDomains {
 		domainStr, ok := domain.(string)
 		if ok {
 			logger.Printf("Extracted domain: %s", domainStr)
 
-			// Create record_ID using timestamp and domain
-			recordID := fmt.Sprintf("%s_%s", timestamp, domainStr)
+			// Generate record_ID with counter if needed
+			mu.Lock()
+			key := fmt.Sprintf("%s_%s", timestamp, domainStr)
+			counter := domainCountMap[key] + 1
+			domainCountMap[key] = counter
+			mu.Unlock()
+
+			var recordID string
+			if counter == 1 {
+				recordID = fmt.Sprintf("%s_%s", timestamp, domainStr)
+			} else {
+				recordID = fmt.Sprintf("%s_%s_%d", timestamp, domainStr, counter)
+			}
 
 			// Publish to NSQ with record_ID and domain
 			publishToNSQ(recordID, domainStr, producer)
