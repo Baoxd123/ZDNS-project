@@ -19,11 +19,12 @@ var domainCountMap = make(map[string]int)
 var mu sync.Mutex
 
 // Publish domain information to NSQ with record_ID
-func publishToNSQ(recordID, domain string, producer *nsq.Producer) {
-	// Create a JSON object with record_ID and domain
+func publishToNSQ(recordID, domain, timestamp string, producer *nsq.Producer, topic string) {
+	// Create a JSON object with record_ID, domain, and timestamp
 	message := map[string]string{
 		"record_ID": recordID,
 		"domain":    domain,
+		"timestamp": timestamp,
 	}
 
 	messageJSON, err := json.Marshal(message)
@@ -32,11 +33,11 @@ func publishToNSQ(recordID, domain string, producer *nsq.Producer) {
 		return
 	}
 
-	err = producer.Publish("domain_names", messageJSON)
+	err = producer.Publish(topic, messageJSON)
 	if err != nil {
-		logger.Printf("Failed to publish domain to NSQ: %s", err)
+		logger.Printf("Failed to publish domain to NSQ topic %s: %s", topic, err)
 	} else {
-		logger.Printf("Successfully published domain to NSQ: %s", messageJSON)
+		logger.Printf("Successfully published domain to NSQ topic %s: %s", topic, messageJSON)
 	}
 }
 
@@ -54,7 +55,7 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 		return
 	}
 
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05Z") // Generate the current timestamp in second precision, in UTC
+	timestamp := time.Now().UTC().Format(time.RFC3339) // Generate the current timestamp in second precision, in UTC
 
 	for _, domain := range allDomains {
 		domainStr, ok := domain.(string)
@@ -75,8 +76,9 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 				recordID = fmt.Sprintf("%s_%s_%d", timestamp, domainStr, counter)
 			}
 
-			// Publish to NSQ with record_ID and domain
-			publishToNSQ(recordID, domainStr, producer)
+			// Publish to both real-time and delayed NSQ topics with record_ID, domain, and timestamp
+			publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names")
+			publishToNSQ(recordID, domainStr, timestamp, producer, "nsq_delayed_1min")
 
 			// Store the individual parts of the certificate in MongoDB along with the domain
 			extensions, _ := leafCert["extensions"].(map[string]interface{})
