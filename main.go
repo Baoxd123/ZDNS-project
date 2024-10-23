@@ -86,9 +86,18 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 			// Publish to real-time NSQ topic
 			publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names", 0)
 
-			// Publish to delayed NSQ topic with a delay of 1 minute
-			delayMs := 60000 // 1 minute delay in milliseconds
-			publishToNSQ(recordID, domainStr, timestamp, producer, "nsq_delayed_1min", delayMs)
+			// Publish to delayed NSQ topics with different delays
+			delayDurations := map[string]int{
+				"nsq_delayed_1min":  60000,   // 1 minute delay in milliseconds
+				"nsq_delayed_5min":  300000,  // 5 minutes delay in milliseconds
+				"nsq_delayed_10min": 600000,  // 10 minutes delay in milliseconds
+				"nsq_delayed_30min": 1800000, // 30 minutes delay in milliseconds
+				"nsq_delayed_1hour": 3600000, // 1 hour delay in milliseconds
+			}
+
+			for topic, delayMs := range delayDurations {
+				publishToNSQ(recordID, domainStr, timestamp, producer, topic, delayMs)
+			}
 
 			// Store the individual parts of the certificate in MongoDB along with the domain
 			extensions, _ := leafCert["extensions"].(map[string]interface{})
@@ -118,6 +127,7 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 				"extended_key_usage":          extensions["extendedKeyUsage"],
 				"certificate_policies":        extensions["certificatePolicies"],
 				"signature_algorithm":         leafCert["signature_algorithm"],
+				"delayTime":                   "real-time, 1min, 5min, 10min, 30min, 1hour",
 			}
 
 			ssl_mongo_project.StoreCertstreamResult(certData)
