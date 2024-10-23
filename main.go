@@ -18,8 +18,8 @@ var logger = log.New(log.Writer(), "certstream-example: ", log.Lshortfile)
 var domainCountMap = make(map[string]int)
 var mu sync.Mutex
 
-// Publish domain information to NSQ with record_ID
-func publishToNSQ(recordID, domain, timestamp string, producer *nsq.Producer, topic string) {
+// Publish domain information to NSQ with record_ID, with optional delay
+func publishToNSQ(recordID, domain, timestamp string, producer *nsq.Producer, topic string, deferMs int) {
 	// Create a JSON object with record_ID, domain, and timestamp
 	message := map[string]string{
 		"record_ID": recordID,
@@ -33,7 +33,14 @@ func publishToNSQ(recordID, domain, timestamp string, producer *nsq.Producer, to
 		return
 	}
 
-	err = producer.Publish(topic, messageJSON)
+	if deferMs > 0 {
+		// Use PublishDeferred for delayed messages
+		err = producer.DeferredPublish(topic, time.Duration(deferMs)*time.Millisecond, messageJSON)
+	} else {
+		// Use Publish for real-time messages
+		err = producer.Publish(topic, messageJSON)
+	}
+
 	if err != nil {
 		logger.Printf("Failed to publish domain to NSQ topic %s: %s", topic, err)
 	} else {
@@ -76,9 +83,12 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 				recordID = fmt.Sprintf("%s_%s_%d", timestamp, domainStr, counter)
 			}
 
-			// Publish to both real-time and delayed NSQ topics with record_ID, domain, and timestamp
-			publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names")
-			publishToNSQ(recordID, domainStr, timestamp, producer, "nsq_delayed_1min")
+			// Publish to real-time NSQ topic
+			publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names", 0)
+
+			// Publish to delayed NSQ topic with a delay of 1 minute
+			delayMs := 60000 // 1 minute delay in milliseconds
+			publishToNSQ(recordID, domainStr, timestamp, producer, "nsq_delayed_1min", delayMs)
 
 			// Store the individual parts of the certificate in MongoDB along with the domain
 			extensions, _ := leafCert["extensions"].(map[string]interface{})
