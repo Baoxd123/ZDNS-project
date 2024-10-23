@@ -66,7 +66,7 @@ func generateRandomString(length int) string {
 }
 
 // Process domain queries in batches
-func handleBatch(domains []string, recordIDs []string, isDelayed bool) {
+func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabel string) {
 	// Create a map to store domain and recordID relationships
 	domainMap := make(map[string]string)
 	for i, domain := range domains {
@@ -87,11 +87,7 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool) {
 		log.Printf("ZDNS batch query failed: %v", err)
 		// Store failure for all domains
 		for originalDomain, recordID := range domainMap {
-			delayTime := 0
-			if isDelayed {
-				delayTime = 1 // Set delay time to 1 minute for delayed messages
-			}
-			storeResult(time.Now().UTC().Format(time.RFC3339), originalDomain, "Batch Query Failed", recordID, delayTime)
+			storeResult(time.Now().UTC().Format(time.RFC3339), originalDomain, "Batch Query Failed", recordID, delayLabel, isDelayed)
 		}
 		return
 	}
@@ -108,11 +104,7 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool) {
 			log.Printf("Failed to unmarshal ZDNS result: %v", err)
 			// Even if unmarshaling fails, store the failure info with correct record ID
 			if recordID, exists := domainMap[result.Name]; exists {
-				delayTime := 0
-				if isDelayed {
-					delayTime = 1 // Set delay time to 1 minute for delayed messages
-				}
-				storeResult(time.Now().UTC().Format(time.RFC3339), result.Name, "Unmarshal Error", recordID, delayTime)
+				storeResult(time.Now().UTC().Format(time.RFC3339), result.Name, "Unmarshal Error", recordID, delayLabel, isDelayed)
 			}
 			continue
 		}
@@ -122,50 +114,27 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool) {
 			if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
 				for _, answer := range result.Results.A.Data.Answers {
 					if answer.Type == "A" {
-						delayTime := 0
-						if isDelayed {
-							delayTime = 1 // Set delay time to 1 minute for delayed messages
-						}
-						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID, delayTime)
+						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID, delayLabel, isDelayed)
 					}
 				}
 			} else {
-				delayTime := 0
-				if isDelayed {
-					delayTime = 1 // Set delay time to 1 minute for delayed messages
-				}
-				storeResult(result.Results.A.Timestamp, result.Name, result.Results.A.Status, recordID, delayTime)
+				storeResult(result.Results.A.Timestamp, result.Name, result.Results.A.Status, recordID, delayLabel, isDelayed)
 			}
 		}
 	}
 }
 
-// Store batch results in MongoDB
-func storeBatchResults(timestamp string, domains []string, recordIDs []string, ips []string, isDelayed bool) {
-	for i := 0; i < len(domains); i++ {
-		ip := "None"
-		if i < len(ips) {
-			ip = ips[i]
-		}
-		delayTime := 0
-		if isDelayed {
-			delayTime = 1 // Set delay time to 1 minute for delayed messages
-		}
-		storeResult(timestamp, domains[i], ip, recordIDs[i], delayTime)
-	}
-}
-
 // Store result in MongoDB and print
-func storeResult(timestamp, domain, ip, recordID string, delayTime int) {
+func storeResult(timestamp, domain, ip, recordID, delayLabel string, isDelayed bool) {
 	timestamp = time.Now().UTC().Format(time.RFC3339) // Convert timestamp to UTC format
-	fmt.Printf("<%s, %s, %s, %s, %d>\n", timestamp, domain, ip, recordID, delayTime)
+	fmt.Printf("<%s, %s, %s, %s, %s>\n", timestamp, domain, ip, recordID, delayLabel)
 
 	_, err := zdnsCollection.InsertOne(context.Background(), map[string]interface{}{
 		"timestamp":  timestamp,
 		"domain":     domain,
 		"ip":         ip,
 		"record_ID":  recordID,
-		"delay_time": delayTime,
+		"delay_time": delayLabel,
 	})
 	if err != nil {
 		log.Printf("Failed to insert into MongoDB: %s", err)
@@ -173,7 +142,7 @@ func storeResult(timestamp, domain, ip, recordID string, delayTime int) {
 }
 
 // Worker function to process messages in batches
-func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool) {
+func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool, delayLabel string) {
 	defer wg.Done()
 
 	// Initialize buffer and counter
@@ -203,12 +172,43 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool
 				continue
 			}
 			difference := time.Since(receivedTimestamp)
-			if difference < time.Minute {
-				// If the message is too early, re-publish it to the delayed topic
-				log.Printf("[Worker %d] Message is too early, re-publishing to delayed queue: %s", id, messageData.Domain)
-				delayedProducer.Publish("nsq_delayed_1min", msg.Body)
-				msg.Finish()
-				continue
+			switch delayLabel {
+			case "1min":
+				if difference < time.Minute {
+					// If the message is too early, re-publish it to the delayed topic
+					log.Printf("[Worker %d] Message is too early, re-publishing to 1min delayed queue: %s", id, messageData.Domain)
+					delayedProducer.Publish("nsq_delayed_1min", msg.Body)
+					msg.Finish()
+					continue
+				}
+			case "5min":
+				if difference < 5*time.Minute {
+					log.Printf("[Worker %d] Message is too early, re-publishing to 5min delayed queue: %s", id, messageData.Domain)
+					delayedProducer.Publish("nsq_delayed_5min", msg.Body)
+					msg.Finish()
+					continue
+				}
+			case "10min":
+				if difference < 10*time.Minute {
+					log.Printf("[Worker %d] Message is too early, re-publishing to 10min delayed queue: %s", id, messageData.Domain)
+					delayedProducer.Publish("nsq_delayed_10min", msg.Body)
+					msg.Finish()
+					continue
+				}
+			case "30min":
+				if difference < 30*time.Minute {
+					log.Printf("[Worker %d] Message is too early, re-publishing to 30min delayed queue: %s", id, messageData.Domain)
+					delayedProducer.Publish("nsq_delayed_30min", msg.Body)
+					msg.Finish()
+					continue
+				}
+			case "1hour":
+				if difference < time.Hour {
+					log.Printf("[Worker %d] Message is too early, re-publishing to 1hour delayed queue: %s", id, messageData.Domain)
+					delayedProducer.Publish("nsq_delayed_1hour", msg.Body)
+					msg.Finish()
+					continue
+				}
 			}
 		}
 
@@ -222,7 +222,7 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool
 		// If the buffer reaches the batch size, execute ZDNS batch query
 		if counter >= BatchSize {
 			log.Printf("[Worker %d] Processing batch of %d domains.", id, counter)
-			handleBatch(domains, recordIDs, isDelayed)
+			handleBatch(domains, recordIDs, isDelayed, delayLabel)
 			domains = nil   // Clear buffer
 			recordIDs = nil // Clear record IDs buffer
 			counter = 0     // Reset counter
@@ -234,7 +234,7 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool
 	// Process remaining messages
 	if counter > 0 {
 		log.Printf("[Worker %d] Processing remaining %d domains.", id, counter)
-		handleBatch(domains, recordIDs, isDelayed)
+		handleBatch(domains, recordIDs, isDelayed, delayLabel)
 	}
 }
 
@@ -272,7 +272,7 @@ func main() {
 	// Start real-time worker goroutines
 	for w := 1; w <= numWorkers; w++ {
 		realTimeWG.Add(1)
-		go worker(w, realTimeJobs, &realTimeWG, false)
+		go worker(w, realTimeJobs, &realTimeWG, false, "real-time")
 	}
 
 	// Handle messages received from real-time NSQ
@@ -287,34 +287,39 @@ func main() {
 		log.Fatal("Failed to connect to nsqlookupd for real-time consumer:", err)
 	}
 
-	// Create NSQ consumer for delayed processing
-	delayedConsumer, err := nsq.NewConsumer("nsq_delayed_1min", "channel", nsq.NewConfig())
-	if err != nil {
-		log.Fatal("Failed to create NSQ delayed consumer:", err)
-	}
-
-	// Create a channel to pass jobs to delayed workers
-	delayedJobs := make(chan *nsq.Message, numWorkers)
+	// Create NSQ consumers for delayed processing
+	delayedTopics := []string{"nsq_delayed_1min", "nsq_delayed_5min", "nsq_delayed_10min", "nsq_delayed_30min", "nsq_delayed_1hour"}
+	delayedLabels := []string{"1min", "5min", "10min", "30min", "1hour"}
 
 	// Create a wait group to manage delayed workers
 	var delayedWG sync.WaitGroup
 
-	// Start delayed worker goroutines
-	for w := 1; w <= numWorkers; w++ {
-		delayedWG.Add(1)
-		go worker(w, delayedJobs, &delayedWG, true)
-	}
+	for i, topic := range delayedTopics {
+		consumer, err := nsq.NewConsumer(topic, "channel", nsq.NewConfig())
+		if err != nil {
+			log.Fatal("Failed to create NSQ delayed consumer for topic ", topic, ":", err)
+		}
 
-	// Handle messages received from delayed NSQ
-	delayedConsumer.AddHandler(nsq.HandlerFunc(func(message *nsq.Message) error {
-		delayedJobs <- message
-		return nil
-	}))
+		// Create a channel to pass jobs to delayed workers
+		delayedJobs := make(chan *nsq.Message, numWorkers)
 
-	// Connect to nsqlookupd service for delayed consumer
-	err = delayedConsumer.ConnectToNSQLookupd("127.0.0.1:4161")
-	if err != nil {
-		log.Fatal("Failed to connect to nsqlookupd for delayed consumer:", err)
+		// Start delayed worker goroutines
+		for w := 1; w <= numWorkers; w++ {
+			delayedWG.Add(1)
+			go worker(w, delayedJobs, &delayedWG, true, delayedLabels[i])
+		}
+
+		// Handle messages received from delayed NSQ
+		consumer.AddHandler(nsq.HandlerFunc(func(message *nsq.Message) error {
+			delayedJobs <- message
+			return nil
+		}))
+
+		// Connect to nsqlookupd service for delayed consumer
+		err = consumer.ConnectToNSQLookupd("127.0.0.1:4161")
+		if err != nil {
+			log.Fatal("Failed to connect to nsqlookupd for delayed consumer for topic ", topic, ":", err)
+		}
 	}
 
 	log.Printf("Started %d workers for real-time and delayed processing.", numWorkers)
