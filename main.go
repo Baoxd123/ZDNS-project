@@ -64,11 +64,12 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 
 	timestamp := time.Now().UTC().Format(time.RFC3339) // Generate the current timestamp in second precision, in UTC
 
+	// Map to keep track of domains that have already been processed in this update for NSQ publishing
+	processedDomains := make(map[string]bool)
+
 	for _, domain := range allDomains {
 		domainStr, ok := domain.(string)
 		if ok {
-			logger.Printf("Extracted domain: %s", domainStr)
-
 			// Generate record_ID with counter if needed
 			mu.Lock()
 			key := fmt.Sprintf("%s_%s", timestamp, domainStr)
@@ -83,23 +84,31 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 				recordID = fmt.Sprintf("%s_%s_%d", timestamp, domainStr, counter)
 			}
 
-			// Publish to real-time NSQ topic
-			publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names", 0)
+			// Check if the domain has already been processed in this batch for NSQ publishing
+			if _, exists := processedDomains[domainStr]; !exists {
+				// Mark the domain as processed for NSQ publishing
+				processedDomains[domainStr] = true
 
-			// Publish to delayed NSQ topics with different delays
-			delayDurations := map[string]int{
-				"nsq_delayed_1min":  60000,   // 1 minute delay in milliseconds
-				"nsq_delayed_5min":  300000,  // 5 minutes delay in milliseconds
-				"nsq_delayed_10min": 600000,  // 10 minutes delay in milliseconds
-				"nsq_delayed_30min": 1800000, // 30 minutes delay in milliseconds
-				"nsq_delayed_1hour": 3600000, // 1 hour delay in milliseconds
+				logger.Printf("Extracted domain for NSQ publish: %s", domainStr)
+
+				// Publish to real-time NSQ topic
+				publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names", 0)
+
+				// Publish to delayed NSQ topics with different delays
+				delayDurations := map[string]int{
+					"nsq_delayed_1min":  60000,   // 1 minute delay in milliseconds
+					"nsq_delayed_5min":  300000,  // 5 minutes delay in milliseconds
+					"nsq_delayed_10min": 600000,  // 10 minutes delay in milliseconds
+					"nsq_delayed_30min": 1800000, // 30 minutes delay in milliseconds
+					"nsq_delayed_1hour": 3600000, // 1 hour delay in milliseconds
+				}
+
+				for topic, delayMs := range delayDurations {
+					publishToNSQ(recordID, domainStr, timestamp, producer, topic, delayMs)
+				}
 			}
 
-			for topic, delayMs := range delayDurations {
-				publishToNSQ(recordID, domainStr, timestamp, producer, topic, delayMs)
-			}
-
-			// Store the individual parts of the certificate in MongoDB along with the domain
+			// Store the individual parts of the certificate in MongoDB along with the domain, regardless of whether it was published to NSQ
 			extensions, _ := leafCert["extensions"].(map[string]interface{})
 			subject, _ := leafCert["subject"].(map[string]interface{})
 			issuer, _ := leafCert["issuer"].(map[string]interface{})
@@ -132,7 +141,6 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 
 			ssl_mongo_project.StoreCertstreamResult(certData)
 			logger.Printf("Stored full certstream result in MongoDB: %v", certData)
-
 		} else {
 			logger.Printf("Invalid domain type")
 		}
