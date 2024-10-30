@@ -35,10 +35,25 @@ type ZDNSResult struct {
 	} `json:"results"`
 }
 
+// ZGrab2 result structure
+type ZGrab2Result struct {
+	Domain        string   `json:"domain"`
+	IPAddress     string   `json:"ip_address"`
+	Success       bool     `json:"success"`
+	RawOutput     string   `json:"raw_output"`
+	RecordID      string   `json:"record_ID"`
+	Issuer        string   `json:"issuer"`
+	Subject       string   `json:"subject"`
+	SANs          []string `json:"sans"`
+	ValidityStart string   `json:"validity_start"`
+	ValidityEnd   string   `json:"validity_end"`
+}
+
 var (
 	mongoClient     *mongo.Client
 	delayedProducer *nsq.Producer
 	zdnsCollection  *mongo.Collection
+	zgrabCollection *mongo.Collection
 )
 
 // Initialize MongoDB connection
@@ -52,6 +67,7 @@ func initMongoDB() {
 
 	mongoClient = client
 	zdnsCollection = client.Database("ssl_project").Collection("zdns_results")
+	zgrabCollection = client.Database("ssl_project").Collection("zgrab2_results")
 }
 
 // Generate a random string of a given length
@@ -115,12 +131,51 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 				for _, answer := range result.Results.A.Data.Answers {
 					if answer.Type == "A" {
 						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID, delayLabel, isDelayed)
+						// Call ZGrab2 for further processing of the IP address
+						handleZGrab2(result.Name, answer.Address, recordID)
 					}
 				}
 			} else {
 				storeResult(result.Results.A.Timestamp, result.Name, result.Results.A.Status, recordID, delayLabel, isDelayed)
 			}
 		}
+	}
+}
+
+// Modified ZGrab2 result parsing to store SSL certificate details in MongoDB.
+func handleZGrab2(domain, ipAddress, recordID string) {
+	// Corrected to use zgrab2 tls with IP address as input from stdin
+	cmd := exec.Command("zgrab2", "tls", "--port", "443", "--timeout", "10s")
+	cmd.Stdin = strings.NewReader(ipAddress) // Provide IP as input
+	out, err := cmd.CombinedOutput()         // Use CombinedOutput to capture both stdout and stderr
+	if err != nil {
+		log.Printf("ZGrab2 failed for domain %s (IP: %s): %v - Output: %s", domain, ipAddress, err, string(out))
+		storeZGrabResult(domain, ipAddress, false, string(out), recordID, "", "", nil, "", "")
+		return
+	}
+
+	// Store the entire ZGrab2 output
+	storeZGrabResult(domain, ipAddress, true, string(out), recordID, "", "", nil, "", "")
+}
+
+// Store ZGrab2 result in MongoDB
+func storeZGrabResult(domain, ipAddress string, success bool, rawOutput, recordID, issuer, subject string, sans []string, validityStart, validityEnd string) {
+	fmt.Printf("<%s, %s, %t, %s, %s, %s, %s, %v, %s, %s>\n", domain, ipAddress, success, rawOutput, recordID, issuer, subject, sans, validityStart, validityEnd)
+
+	_, err := zgrabCollection.InsertOne(context.Background(), map[string]interface{}{
+		"domain":         domain,
+		"ip_address":     ipAddress,
+		"success":        success,
+		"raw_output":     rawOutput,
+		"record_ID":      recordID,
+		"issuer":         issuer,
+		"subject":        subject,
+		"sans":           sans,
+		"validity_start": validityStart,
+		"validity_end":   validityEnd,
+	})
+	if err != nil {
+		log.Printf("Failed to insert ZGrab2 result into MongoDB: %s - Data: domain=%s, ip_address=%s, success=%t, raw_output=%s, record_ID=%s", err, domain, ipAddress, success, rawOutput, recordID)
 	}
 }
 
