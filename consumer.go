@@ -142,19 +142,20 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 	}
 }
 
-// Modified ZGrab2 result parsing to store SSL certificate details in MongoDB.
+// handleZGrab2 function with updated command format
 func handleZGrab2(domain, ipAddress, recordID string) {
-	// Corrected to use zgrab2 tls with IP address as input from stdin
-	cmd := exec.Command("zgrab2", "tls", "--port", "443", "--timeout", "10s")
-	cmd.Stdin = strings.NewReader(ipAddress) // Provide IP as input
-	out, err := cmd.CombinedOutput()         // Use CombinedOutput to capture both stdout and stderr
+	// Corrected to use zgrab2sentinel tls with domain and IP address as input from stdin
+	cmd := exec.Command("zgrab2sentinel", "tls", "--port", "443", "--timeout", "10s")
+	// Provide IP and domain as input in the required format
+	cmd.Stdin = strings.NewReader(fmt.Sprintf("%s, %s", ipAddress, domain))
+	out, err := cmd.CombinedOutput() // Use CombinedOutput to capture both stdout and stderr
 	if err != nil {
-		log.Printf("ZGrab2 failed for domain %s (IP: %s): %v - Output: %s", domain, ipAddress, err, string(out))
+		log.Printf("ZGrab2sentinel failed for domain %s (IP: %s): %v - Output: %s", domain, ipAddress, err, string(out))
 		storeZGrabResult(domain, ipAddress, false, string(out), recordID, "", "", nil, "", "")
 		return
 	}
 
-	// Store the entire ZGrab2 output
+	// Store the entire ZGrab2sentinel output
 	storeZGrabResult(domain, ipAddress, true, string(out), recordID, "", "", nil, "", "")
 }
 
