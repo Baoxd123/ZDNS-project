@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -17,6 +18,14 @@ var logger = log.New(log.Writer(), "certstream-example: ", log.Lshortfile)
 // Map to keep track of domain counts per second
 var domainCountMap = make(map[string]int)
 var mu sync.Mutex
+
+// Log file for processing speed
+var logFile *os.File
+
+// Certstream counters per second
+var certstreamCertCounter int
+var certstreamDomainCounter int
+var counterMutex sync.Mutex
 
 // Publish domain information to NSQ with record_ID, with optional delay
 func publishToNSQ(recordID, domain, timestamp string, producer *nsq.Producer, topic string, deferMs int) {
@@ -62,6 +71,9 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 		return
 	}
 
+	// Increment certificate counter
+	incrementCertstreamCertCounter()
+
 	timestamp := time.Now().UTC().Format(time.RFC3339) // Generate the current timestamp in second precision, in UTC
 
 	for _, domain := range allDomains {
@@ -85,6 +97,7 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 
 			// Publish to real-time NSQ topic
 			publishToNSQ(recordID, domainStr, timestamp, producer, "domain_names", 0)
+			incrementCertstreamDomainCounter() //record the real-time domain speed
 
 			// Publish to delayed NSQ topics with different delays
 			delayDurations := map[string]int{
@@ -97,6 +110,7 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 
 			for topic, delayMs := range delayDurations {
 				publishToNSQ(recordID, domainStr, timestamp, producer, topic, delayMs)
+
 			}
 
 			// Store the individual parts of the certificate in MongoDB along with the domain
@@ -139,6 +153,40 @@ func handleCertificateUpdate(data map[string]interface{}, producer *nsq.Producer
 	}
 }
 
+// Increment Certstream certificate counter
+func incrementCertstreamCertCounter() {
+	counterMutex.Lock()
+	certstreamCertCounter++
+	counterMutex.Unlock()
+}
+
+// Increment Certstream domain counter
+func incrementCertstreamDomainCounter() {
+	counterMutex.Lock()
+	certstreamDomainCounter++
+	counterMutex.Unlock()
+}
+
+// Log statistics to the log file every second
+func startCertstreamLogging() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		counterMutex.Lock()
+		certstreamCertCount := certstreamCertCounter
+		certstreamDomainCount := certstreamDomainCounter
+		certstreamCertCounter = 0
+		certstreamDomainCounter = 0
+		counterMutex.Unlock()
+
+		timestamp := time.Now().UTC().Format(time.RFC3339)
+		logEntry := fmt.Sprintf("<certstream-cert, %d, %s>\n<certstream-domain-realTime, %d, %s>\n", certstreamCertCount, timestamp, certstreamDomainCount, timestamp)
+		if _, err := logFile.WriteString(logEntry); err != nil {
+			log.Printf("Failed to write to processing speed log file: %v", err)
+		}
+	}
+}
+
 func main() {
 	ssl_mongo_project.InitMongoDB()
 
@@ -147,6 +195,16 @@ func main() {
 		log.Fatal("Failed to create NSQ producer:", err)
 	}
 	defer producer.Stop()
+
+	// Initialize log file
+	logFile, err = os.OpenFile("certstream_speed.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Failed to open processing speed log file: %v", err)
+	}
+	defer logFile.Close()
+
+	// Start logging certstream processing speed
+	go startCertstreamLogging()
 
 	stream, errStream := certstream.CertStreamEventStream(false)
 
