@@ -53,6 +53,7 @@ type ZGrab2Result struct {
 var (
 	mongoClient     *mongo.Client
 	delayedProducer *nsq.Producer
+	dnsProducer     *nsq.Producer
 	zdnsCollection  *mongo.Collection
 	zgrabCollection *mongo.Collection
 )
@@ -129,11 +130,19 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 		// Check and store results
 		if recordID, exists := domainMap[result.Name]; exists {
 			if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
+				// Store all <domain, ip> pairs in MongoDB
 				for _, answer := range result.Results.A.Data.Answers {
 					if answer.Type == "A" {
 						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID, delayLabel, isDelayed)
-						// Call ZGrab2 for further processing of the IP address
-						handleZGrab2(result.Name, answer.Address, recordID)
+					}
+				}
+
+				// Randomly select one <domain, ip> pair to publish to ZDNS queue
+				if len(result.Results.A.Data.Answers) > 0 {
+					randomIndex := rand.Intn(len(result.Results.A.Data.Answers))
+					selectedAnswer := result.Results.A.Data.Answers[randomIndex]
+					if selectedAnswer.Type == "A" {
+						publishToZDNSQueue(result.Name, selectedAnswer.Address, recordID, result.Results.A.Timestamp, delayLabel)
 					}
 				}
 			} else {
@@ -143,60 +152,24 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 	}
 }
 
-// Modified ZGrab2 result parsing to store SSL certificate details in MongoDB.
-func handleZGrab2(domain, ipAddress, recordID string) {
-	// Corrected to use zgrab2 tls with IP address as input from stdin
-	cmd := exec.Command("zgrab2", "tls", "--port", "443", "--timeout", "10s")
-	cmd.Stdin = strings.NewReader(ipAddress) // Provide IP as input
-	out, err := cmd.CombinedOutput()         // Use CombinedOutput to capture both stdout and stderr
+// Publish domain and IP to new NSQ queue
+func publishToZDNSQueue(domain, ipAddress, recordID, timestamp, delayLabel string) {
+	data := map[string]string{
+		"domain":     domain,
+		"ip_address": ipAddress,
+		"record_ID":  recordID,
+		"timestamp":  timestamp,
+		"delay_time": delayLabel,
+	}
+	jsonData, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("ZGrab2 failed for domain %s (IP: %s): %v - Output: %s", domain, ipAddress, err, string(out))
-		storeZGrabResult(domain, ipAddress, false, string(out), recordID, "", "", nil, "", "")
+		log.Printf("Failed to marshal data for zdns_domain_ip queue: %v", err)
 		return
 	}
 
-	// Extract required fields from ZGrab2 output using regex
-	output := string(out)
-	issuerCommonName := extractField(output, `"issuer":\s*\{.*?"common_name":\s*"(.*?)"`)
-	subjectCommonName := extractField(output, `"subject_dn":\s*"(.*?)"`)
-	//keyUsage := extractField(output, `"key_usage":\s*\{.*?"value":\s*"(.*?)"`)
-	subjectAltNames := extractField(output, `"subject_alt_name":\s*\{.*?"dns_names":\s*\[(.*?)\]`)
-	validityStart := extractField(output, `"validity":\s*\{.*?"start":\s*"(.*?)"`)
-	validityEnd := extractField(output, `"validity":\s*\{.*?"end":\s*"(.*?)"`)
-
-	// Store the extracted fields in MongoDB
-	storeZGrabResult(domain, ipAddress, true, output, recordID, issuerCommonName, subjectCommonName,
-		[]string{subjectAltNames}, validityStart, validityEnd)
-}
-
-// Utility function to extract fields using regex
-func extractField(input, regexPattern string) string {
-	re := regexp.MustCompile(regexPattern)
-	match := re.FindStringSubmatch(input)
-	if len(match) > 1 {
-		return match[1]
-	}
-	return ""
-}
-
-// Store ZGrab2 result in MongoDB
-func storeZGrabResult(domain, ipAddress string, success bool, rawOutput, recordID, issuer, subject string, sans []string, validityStart, validityEnd string) {
-	fmt.Printf("<%s, %s, %t, %s, %s, %s, %s, %v, %s, %s>\n", domain, ipAddress, success, rawOutput, recordID, issuer, subject, sans, validityStart, validityEnd)
-
-	_, err := zgrabCollection.InsertOne(context.Background(), map[string]interface{}{
-		"domain":         domain,
-		"ip_address":     ipAddress,
-		"success":        success,
-		"raw_output":     rawOutput,
-		"record_ID":      recordID,
-		"issuer":         issuer,
-		"subject":        subject,
-		"sans":           sans,
-		"validity_start": validityStart,
-		"validity_end":   validityEnd,
-	})
+	err = dnsProducer.Publish("zdns_domain_ip", jsonData)
 	if err != nil {
-		log.Printf("Failed to insert ZGrab2 result into MongoDB: %s - Data: domain=%s, ip_address=%s, success=%t, raw_output=%s, record_ID=%s", err, domain, ipAddress, success, rawOutput, recordID)
+		log.Printf("Failed to publish to zdns_domain_ip queue: %v", err)
 	}
 }
 
@@ -214,6 +187,159 @@ func storeResult(timestamp, domain, ip, recordID, delayLabel string, isDelayed b
 	})
 	if err != nil {
 		log.Printf("Failed to insert into MongoDB: %s", err)
+	}
+}
+
+// Worker function to handle ZGrab2sentinel tasks from NSQ
+func zgrabWorker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for msg := range jobs {
+		// Parse the JSON message to extract domain and IP
+		var messageData struct {
+			Domain    string `json:"domain"`
+			IPAddress string `json:"ip_address"`
+			RecordID  string `json:"record_ID"`
+			Timestamp string `json:"timestamp"`
+			DelayTime string `json:"delay_time"`
+		}
+		if err := json.Unmarshal(msg.Body, &messageData); err != nil {
+			log.Printf("Failed to unmarshal ZGrab2 NSQ message: %v", err)
+			msg.Finish()
+			continue
+		}
+
+		// Corrected to use zgrab2sentinel tls with domain and IP address as input from stdin
+		cmd := exec.Command("zgrab2sentinel", "tls", "--port", "443", "--timeout", "10s")
+		// Provide IP and domain as input in the required format
+		cmd.Stdin = strings.NewReader(fmt.Sprintf("%s, %s", messageData.IPAddress, messageData.Domain))
+		out, err := cmd.CombinedOutput() // Use CombinedOutput to capture both stdout and stderr
+		if err != nil {
+			log.Printf("ZGrab2sentinel failed for domain %s (IP: %s): %v - Output: %s", messageData.Domain, messageData.IPAddress, err, string(out))
+			storeZGrabResult(messageData.Domain, messageData.IPAddress, false, string(out), messageData.RecordID)
+			msg.Finish()
+			continue
+		}
+
+		// Store the entire ZGrab2sentinel output
+		storeZGrabResult(messageData.Domain, messageData.IPAddress, true, string(out), messageData.RecordID)
+		msg.Finish()
+	}
+}
+
+// Store ZGrab2 result in MongoDB
+func storeZGrabResult(domain, ipAddress string, success bool, rawOutput, recordID string) {
+	// Extract the JSON part from raw_output using a regular expression
+	re := regexp.MustCompile(`(?m)^\{.*\}$`)
+	matches := re.FindString(rawOutput)
+
+	if matches == "" {
+		log.Printf("Failed to extract JSON from raw output for domain %s", domain)
+		return
+	}
+
+	// Define struct to parse the certificate data
+	type ParsedCertificate struct {
+		Version            int    `json:"version"`
+		SerialNumber       string `json:"serial_number"`
+		SignatureAlgorithm struct {
+			Name string `json:"name"`
+			OID  string `json:"oid"`
+		} `json:"signature_algorithm"`
+		Issuer struct {
+			CommonName   string `json:"common_name"`
+			Country      string `json:"country"`
+			Organization string `json:"organization"`
+		} `json:"issuer"`
+		Validity struct {
+			Start  string `json:"start"`
+			End    string `json:"end"`
+			Length int    `json:"length"`
+		} `json:"validity"`
+		Subject struct {
+			CommonName string `json:"common_name"`
+		} `json:"subject"`
+		Fingerprints struct {
+			SHA256 string `json:"sha256"`
+			MD5    string `json:"md5"`
+			SHA1   string `json:"sha1"`
+		} `json:"fingerprints"`
+	}
+
+	type Extensions struct {
+		KeyUsage struct {
+			DigitalSignature bool `json:"digital_signature"`
+			Value            int  `json:"value"`
+		} `json:"key_usage"`
+		BasicConstraints struct {
+			IsCA bool `json:"is_ca"`
+		} `json:"basic_constraints"`
+		SubjectAltName struct {
+			DNSNames []string `json:"dns_names"`
+		} `json:"subject_alt_name"`
+		AuthorityKeyID string `json:"authority_key_id"`
+		SubjectKeyID   string `json:"subject_key_id"`
+	}
+
+	type TLSResult struct {
+		HandshakeLog struct {
+			ServerCertificates struct {
+				Certificate struct {
+					Raw    string            `json:"raw"`
+					Parsed ParsedCertificate `json:"parsed"`
+				} `json:"certificate"`
+				Extensions Extensions `json:"extensions"`
+			} `json:"server_certificates"`
+		} `json:"handshake_log"`
+	}
+
+	var output struct {
+		Data struct {
+			TLS TLSResult `json:"tls"`
+		} `json:"data"`
+	}
+
+	// Parse the JSON data
+	if err := json.Unmarshal([]byte(matches), &output); err != nil {
+		log.Printf("Failed to unmarshal TLS data for domain %s: %v", domain, err)
+		return
+	}
+
+	// Extract certificate information
+	certificate := output.Data.TLS.HandshakeLog.ServerCertificates.Certificate
+	extensions := output.Data.TLS.HandshakeLog.ServerCertificates.Extensions
+
+	// Print the fields to be stored for debugging purposes
+	fmt.Printf("<%s, %s, %t, %s, %+v>\n", domain, ipAddress, success, recordID, certificate)
+
+	// Store the parsed result along with the complete raw output into MongoDB
+	_, err := zgrabCollection.InsertOne(context.Background(), map[string]interface{}{
+		"domain":     domain,
+		"ip_address": ipAddress,
+		"certificate": map[string]interface{}{
+			"raw": certificate.Raw,
+			"parsed": map[string]interface{}{
+				"version":             certificate.Parsed.Version,
+				"serial_number":       certificate.Parsed.SerialNumber,
+				"signature_algorithm": certificate.Parsed.SignatureAlgorithm,
+				"issuer":              certificate.Parsed.Issuer,
+				"validity":            certificate.Parsed.Validity,
+				"subject":             certificate.Parsed.Subject,
+				"fingerprints":        certificate.Parsed.Fingerprints,
+			},
+			"extensions": map[string]interface{}{
+				"key_usage":         extensions.KeyUsage,
+				"basic_constraints": extensions.BasicConstraints,
+				"subject_alt_name":  extensions.SubjectAltName,
+				"authority_key_id":  extensions.AuthorityKeyID,
+				"subject_key_id":    extensions.SubjectKeyID,
+			},
+		},
+		"record_id": recordID,
+		"raw_data":  rawOutput, // Store the entire raw output in a separate field called "raw_data"
+	})
+	if err != nil {
+		log.Printf("Failed to insert ZGrab2 result into MongoDB: %s", err)
 	}
 }
 
@@ -240,53 +366,7 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool
 		}
 
 		// If this is a delayed worker, check the timestamp
-		if isDelayed {
-			receivedTimestamp, err := time.Parse(time.RFC3339, messageData.Timestamp)
-			if err != nil {
-				log.Printf("Failed to parse timestamp: %v", err)
-				msg.Finish()
-				continue
-			}
-			difference := time.Since(receivedTimestamp)
-			switch delayLabel {
-			case "1min":
-				if difference < time.Minute {
-					// If the message is too early, re-publish it to the delayed topic
-					log.Printf("[Worker %d] Message is too early, re-publishing to 1min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_1min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "5min":
-				if difference < 5*time.Minute {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 5min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_5min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "10min":
-				if difference < 10*time.Minute {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 10min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_10min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "30min":
-				if difference < 30*time.Minute {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 30min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_30min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "1hour":
-				if difference < time.Hour {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 1hour delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_1hour", msg.Body)
-					msg.Finish()
-					continue
-				}
-			}
-		}
+		// In fact, it can be removed
 
 		domain := messageData.Domain
 		recordID := messageData.RecordID
@@ -330,8 +410,15 @@ func main() {
 	}
 	delayedProducer = producer
 
+	// Create NSQ producer for ZDNS queue
+	dnsProducer, err = nsq.NewProducer("127.0.0.1:4150", nsq.NewConfig())
+	if err != nil {
+		log.Fatal("Failed to create ZDNS NSQ producer:", err)
+	}
+
 	// Number of worker goroutines
 	numWorkers := 20
+	numZgrabWorkers := 2000
 
 	// Create NSQ consumer for real-time processing
 	realTimeConsumer, err := nsq.NewConsumer("domain_names", "channel", nsq.NewConfig())
@@ -398,9 +485,40 @@ func main() {
 		}
 	}
 
-	log.Printf("Started %d workers for real-time and delayed processing.", numWorkers)
+	// Create NSQ consumer for zdns_domain_ip
+	zdnsConsumer, err := nsq.NewConsumer("zdns_domain_ip", "channel", nsq.NewConfig())
+	if err != nil {
+		log.Fatal("Failed to create NSQ zdns_domain_ip consumer:", err)
+	}
+
+	// Create a channel to pass jobs to zgrab workers
+	zgrabJobs := make(chan *nsq.Message, numWorkers)
+
+	// Create a wait group to manage ZGrab workers
+	var zgrabWG sync.WaitGroup
+
+	// Start ZGrab worker goroutines
+	for w := 1; w <= numZgrabWorkers; w++ {
+		zgrabWG.Add(1)
+		go zgrabWorker(w, zgrabJobs, &zgrabWG)
+	}
+
+	// Handle messages received from zdns_domain_ip NSQ
+	zdnsConsumer.AddHandler(nsq.HandlerFunc(func(message *nsq.Message) error {
+		zgrabJobs <- message
+		return nil
+	}))
+
+	// Connect to nsqlookupd service for zdns_domain_ip consumer
+	err = zdnsConsumer.ConnectToNSQLookupd("127.0.0.1:4161")
+	if err != nil {
+		log.Fatal("Failed to connect to nsqlookupd for zdns_domain_ip consumer:", err)
+	}
+
+	log.Printf("Started %d workers for real-time, delayed, and ZGrab2 processing.", numWorkers)
 
 	// Wait for workers to finish (which they never will in this case)
 	realTimeWG.Wait()
 	delayedWG.Wait()
+	zgrabWG.Wait()
 }
