@@ -52,6 +52,7 @@ type ZGrab2Result struct {
 var (
 	mongoClient     *mongo.Client
 	delayedProducer *nsq.Producer
+	dnsProducer     *nsq.Producer
 	zdnsCollection  *mongo.Collection
 	zgrabCollection *mongo.Collection
 )
@@ -131,8 +132,8 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 				for _, answer := range result.Results.A.Data.Answers {
 					if answer.Type == "A" {
 						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID, delayLabel, isDelayed)
-						// Call ZGrab2 for further processing of the IP address
-						handleZGrab2(result.Name, answer.Address, recordID)
+						// Publish the domain and IP to the new NSQ queue for ZGrab2
+						publishToZDNSQueue(result.Name, answer.Address, recordID, result.Results.A.Timestamp, delayLabel)
 					}
 				}
 			} else {
@@ -142,21 +143,79 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 	}
 }
 
-// handleZGrab2 function with updated command format
-func handleZGrab2(domain, ipAddress, recordID string) {
-	// Corrected to use zgrab2sentinel tls with domain and IP address as input from stdin
-	cmd := exec.Command("zgrab2sentinel", "tls", "--port", "443", "--timeout", "10s")
-	// Provide IP and domain as input in the required format
-	cmd.Stdin = strings.NewReader(fmt.Sprintf("%s, %s", ipAddress, domain))
-	out, err := cmd.CombinedOutput() // Use CombinedOutput to capture both stdout and stderr
+// Publish domain and IP to new NSQ queue
+func publishToZDNSQueue(domain, ipAddress, recordID, timestamp, delayLabel string) {
+	data := map[string]string{
+		"domain":     domain,
+		"ip_address": ipAddress,
+		"record_ID":  recordID,
+		"timestamp":  timestamp,
+		"delay_time": delayLabel,
+	}
+	jsonData, err := json.Marshal(data)
 	if err != nil {
-		log.Printf("ZGrab2sentinel failed for domain %s (IP: %s): %v - Output: %s", domain, ipAddress, err, string(out))
-		storeZGrabResult(domain, ipAddress, false, string(out), recordID, "", "", nil, "", "")
+		log.Printf("Failed to marshal data for zdns_domain_ip queue: %v", err)
 		return
 	}
 
-	// Store the entire ZGrab2sentinel output
-	storeZGrabResult(domain, ipAddress, true, string(out), recordID, "", "", nil, "", "")
+	err = dnsProducer.Publish("zdns_domain_ip", jsonData)
+	if err != nil {
+		log.Printf("Failed to publish to zdns_domain_ip queue: %v", err)
+	}
+}
+
+// Store result in MongoDB and print
+func storeResult(timestamp, domain, ip, recordID, delayLabel string, isDelayed bool) {
+	timestamp = time.Now().UTC().Format(time.RFC3339) // Convert timestamp to UTC format
+	fmt.Printf("<%s, %s, %s, %s, %s>\n", timestamp, domain, ip, recordID, delayLabel)
+
+	_, err := zdnsCollection.InsertOne(context.Background(), map[string]interface{}{
+		"timestamp":  timestamp,
+		"domain":     domain,
+		"ip":         ip,
+		"record_ID":  recordID,
+		"delay_time": delayLabel,
+	})
+	if err != nil {
+		log.Printf("Failed to insert into MongoDB: %s", err)
+	}
+}
+
+// Worker function to handle ZGrab2sentinel tasks from NSQ
+func zgrabWorker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for msg := range jobs {
+		// Parse the JSON message to extract domain and IP
+		var messageData struct {
+			Domain    string `json:"domain"`
+			IPAddress string `json:"ip_address"`
+			RecordID  string `json:"record_ID"`
+			Timestamp string `json:"timestamp"`
+			DelayTime string `json:"delay_time"`
+		}
+		if err := json.Unmarshal(msg.Body, &messageData); err != nil {
+			log.Printf("Failed to unmarshal ZGrab2 NSQ message: %v", err)
+			msg.Finish()
+			continue
+		}
+
+		// Corrected to use zgrab2sentinel tls with domain and IP address as input from stdin
+		cmd := exec.Command("zgrab2sentinel", "tls", "--port", "443", "--timeout", "10s")
+		// Provide IP and domain as input in the required format
+		cmd.Stdin = strings.NewReader(fmt.Sprintf("%s, %s", messageData.IPAddress, messageData.Domain))
+		out, err := cmd.CombinedOutput() // Use CombinedOutput to capture both stdout and stderr
+		if err != nil {
+			log.Printf("ZGrab2sentinel failed for domain %s (IP: %s): %v - Output: %s", messageData.Domain, messageData.IPAddress, err, string(out))
+			storeZGrabResult(messageData.Domain, messageData.IPAddress, false, string(out), messageData.RecordID, "", "", nil, "", "")
+			msg.Finish()
+			continue
+		}
+
+		// Store the entire ZGrab2sentinel output
+		storeZGrabResult(messageData.Domain, messageData.IPAddress, true, string(out), messageData.RecordID, "", "", nil, "", "")
+		msg.Finish()
+	}
 }
 
 // Store ZGrab2 result in MongoDB
@@ -177,23 +236,6 @@ func storeZGrabResult(domain, ipAddress string, success bool, rawOutput, recordI
 	})
 	if err != nil {
 		log.Printf("Failed to insert ZGrab2 result into MongoDB: %s - Data: domain=%s, ip_address=%s, success=%t, raw_output=%s, record_ID=%s", err, domain, ipAddress, success, rawOutput, recordID)
-	}
-}
-
-// Store result in MongoDB and print
-func storeResult(timestamp, domain, ip, recordID, delayLabel string, isDelayed bool) {
-	timestamp = time.Now().UTC().Format(time.RFC3339) // Convert timestamp to UTC format
-	fmt.Printf("<%s, %s, %s, %s, %s>\n", timestamp, domain, ip, recordID, delayLabel)
-
-	_, err := zdnsCollection.InsertOne(context.Background(), map[string]interface{}{
-		"timestamp":  timestamp,
-		"domain":     domain,
-		"ip":         ip,
-		"record_ID":  recordID,
-		"delay_time": delayLabel,
-	})
-	if err != nil {
-		log.Printf("Failed to insert into MongoDB: %s", err)
 	}
 }
 
@@ -220,53 +262,7 @@ func worker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup, isDelayed bool
 		}
 
 		// If this is a delayed worker, check the timestamp
-		if isDelayed {
-			receivedTimestamp, err := time.Parse(time.RFC3339, messageData.Timestamp)
-			if err != nil {
-				log.Printf("Failed to parse timestamp: %v", err)
-				msg.Finish()
-				continue
-			}
-			difference := time.Since(receivedTimestamp)
-			switch delayLabel {
-			case "1min":
-				if difference < time.Minute {
-					// If the message is too early, re-publish it to the delayed topic
-					log.Printf("[Worker %d] Message is too early, re-publishing to 1min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_1min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "5min":
-				if difference < 5*time.Minute {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 5min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_5min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "10min":
-				if difference < 10*time.Minute {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 10min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_10min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "30min":
-				if difference < 30*time.Minute {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 30min delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_30min", msg.Body)
-					msg.Finish()
-					continue
-				}
-			case "1hour":
-				if difference < time.Hour {
-					log.Printf("[Worker %d] Message is too early, re-publishing to 1hour delayed queue: %s", id, messageData.Domain)
-					delayedProducer.Publish("nsq_delayed_1hour", msg.Body)
-					msg.Finish()
-					continue
-				}
-			}
-		}
+		// In fact, it can be removed
 
 		domain := messageData.Domain
 		recordID := messageData.RecordID
@@ -310,8 +306,15 @@ func main() {
 	}
 	delayedProducer = producer
 
+	// Create NSQ producer for ZDNS queue
+	dnsProducer, err = nsq.NewProducer("127.0.0.1:4150", nsq.NewConfig())
+	if err != nil {
+		log.Fatal("Failed to create ZDNS NSQ producer:", err)
+	}
+
 	// Number of worker goroutines
 	numWorkers := 20
+	numZgrabWorkers := 2000
 
 	// Create NSQ consumer for real-time processing
 	realTimeConsumer, err := nsq.NewConsumer("domain_names", "channel", nsq.NewConfig())
@@ -378,9 +381,40 @@ func main() {
 		}
 	}
 
-	log.Printf("Started %d workers for real-time and delayed processing.", numWorkers)
+	// Create NSQ consumer for zdns_domain_ip
+	zdnsConsumer, err := nsq.NewConsumer("zdns_domain_ip", "channel", nsq.NewConfig())
+	if err != nil {
+		log.Fatal("Failed to create NSQ zdns_domain_ip consumer:", err)
+	}
+
+	// Create a channel to pass jobs to zgrab workers
+	zgrabJobs := make(chan *nsq.Message, numWorkers)
+
+	// Create a wait group to manage ZGrab workers
+	var zgrabWG sync.WaitGroup
+
+	// Start ZGrab worker goroutines
+	for w := 1; w <= numZgrabWorkers; w++ {
+		zgrabWG.Add(1)
+		go zgrabWorker(w, zgrabJobs, &zgrabWG)
+	}
+
+	// Handle messages received from zdns_domain_ip NSQ
+	zdnsConsumer.AddHandler(nsq.HandlerFunc(func(message *nsq.Message) error {
+		zgrabJobs <- message
+		return nil
+	}))
+
+	// Connect to nsqlookupd service for zdns_domain_ip consumer
+	err = zdnsConsumer.ConnectToNSQLookupd("127.0.0.1:4161")
+	if err != nil {
+		log.Fatal("Failed to connect to nsqlookupd for zdns_domain_ip consumer:", err)
+	}
+
+	log.Printf("Started %d workers for real-time, delayed, and ZGrab2 processing.", numWorkers)
 
 	// Wait for workers to finish (which they never will in this case)
 	realTimeWG.Wait()
 	delayedWG.Wait()
+	zgrabWG.Wait()
 }
