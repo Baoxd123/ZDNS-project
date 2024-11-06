@@ -129,11 +129,19 @@ func handleBatch(domains []string, recordIDs []string, isDelayed bool, delayLabe
 		// Check and store results
 		if recordID, exists := domainMap[result.Name]; exists {
 			if result.Results.A.Status == "NOERROR" && len(result.Results.A.Data.Answers) > 0 {
+				// Store all <domain, ip> pairs in MongoDB
 				for _, answer := range result.Results.A.Data.Answers {
 					if answer.Type == "A" {
 						storeResult(result.Results.A.Timestamp, result.Name, answer.Address, recordID, delayLabel, isDelayed)
-						// Publish the domain and IP to the new NSQ queue for ZGrab2
-						publishToZDNSQueue(result.Name, answer.Address, recordID, result.Results.A.Timestamp, delayLabel)
+					}
+				}
+
+				// Randomly select one <domain, ip> pair to publish to ZDNS queue
+				if len(result.Results.A.Data.Answers) > 0 {
+					randomIndex := rand.Intn(len(result.Results.A.Data.Answers))
+					selectedAnswer := result.Results.A.Data.Answers[randomIndex]
+					if selectedAnswer.Type == "A" {
+						publishToZDNSQueue(result.Name, selectedAnswer.Address, recordID, result.Results.A.Timestamp, delayLabel)
 					}
 				}
 			} else {
