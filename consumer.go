@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +48,16 @@ type ZGrab2Result struct {
 	SANs          []string `json:"sans"`
 	ValidityStart string   `json:"validity_start"`
 	ValidityEnd   string   `json:"validity_end"`
+}
+
+// CertificateDocument represents the structure to store in MongoDB
+type CertificateDocument struct {
+	IP       string                 `json:"ip"`
+	Domain   string                 `json:"domain"`
+	Metadata map[string]interface{} `json:"metadata"`
+	Data     map[string]interface{} `json:"data"`
+	Raw      string                 `json:"raw_output"`
+	RecordID string                 `json:"record_id"`
 }
 
 var (
@@ -275,7 +284,7 @@ func zgrabWorker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 		cmd := exec.Command("zgrab2sentinel", "tls", "--port", "443", "--timeout", "10s")
 		// Provide IP and domain as input in the required format
 		cmd.Stdin = strings.NewReader(fmt.Sprintf("%s, %s", messageData.IPAddress, messageData.Domain))
-		out, err := cmd.CombinedOutput() // Use CombinedOutput to capture both stdout and stderr
+		out, err := cmd.Output() // Use Output to capture stdout only
 		if err != nil {
 			log.Printf("ZGrab2sentinel failed for domain %s (IP: %s): %v - Output: %s", messageData.Domain, messageData.IPAddress, err, string(out))
 			storeZGrabResult(messageData.Domain, messageData.IPAddress, false, string(out), messageData.RecordID)
@@ -290,119 +299,49 @@ func zgrabWorker(id int, jobs <-chan *nsq.Message, wg *sync.WaitGroup) {
 	}
 }
 
-// Store ZGrab2 result in MongoDB
-func storeZGrabResult(domain, ipAddress string, success bool, rawOutput, recordID string) {
-	// Extract the JSON part from raw_output using a regular expression
-	re := regexp.MustCompile(`(?m)^\{.*\}$`)
-	matches := re.FindString(rawOutput)
-
-	if matches == "" {
-		log.Printf("Failed to extract JSON from raw output for domain %s", domain)
-		return
-	}
-
-	// Define struct to parse the certificate data
-	type ParsedCertificate struct {
-		Version            int    `json:"version"`
-		SerialNumber       string `json:"serial_number"`
-		SignatureAlgorithm struct {
-			Name string `json:"name"`
-			OID  string `json:"oid"`
-		} `json:"signature_algorithm"`
-		Issuer struct {
-			CommonName   string `json:"common_name"`
-			Country      string `json:"country"`
-			Organization string `json:"organization"`
-		} `json:"issuer"`
-		Validity struct {
-			Start  string `json:"start"`
-			End    string `json:"end"`
-			Length int    `json:"length"`
-		} `json:"validity"`
-		Subject struct {
-			CommonName string `json:"common_name"`
-		} `json:"subject"`
-		Fingerprints struct {
-			SHA256 string `json:"sha256"`
-			MD5    string `json:"md5"`
-			SHA1   string `json:"sha1"`
-		} `json:"fingerprints"`
-	}
-
-	type Extensions struct {
-		KeyUsage struct {
-			DigitalSignature bool `json:"digital_signature"`
-			Value            int  `json:"value"`
-		} `json:"key_usage"`
-		BasicConstraints struct {
-			IsCA bool `json:"is_ca"`
-		} `json:"basic_constraints"`
-		SubjectAltName struct {
-			DNSNames []string `json:"dns_names"`
-		} `json:"subject_alt_name"`
-		AuthorityKeyID string `json:"authority_key_id"`
-		SubjectKeyID   string `json:"subject_key_id"`
-	}
-
-	type TLSResult struct {
-		HandshakeLog struct {
-			ServerCertificates struct {
-				Certificate struct {
-					Raw    string            `json:"raw"`
-					Parsed ParsedCertificate `json:"parsed"`
-				} `json:"certificate"`
-				Extensions Extensions `json:"extensions"`
-			} `json:"server_certificates"`
-		} `json:"handshake_log"`
-	}
-
-	var output struct {
-		Data struct {
-			TLS TLSResult `json:"tls"`
-		} `json:"data"`
-	}
-
-	// Parse the JSON data
-	if err := json.Unmarshal([]byte(matches), &output); err != nil {
-		log.Printf("Failed to unmarshal TLS data for domain %s: %v", domain, err)
-		return
-	}
-
-	// Extract certificate information
-	certificate := output.Data.TLS.HandshakeLog.ServerCertificates.Certificate
-	extensions := output.Data.TLS.HandshakeLog.ServerCertificates.Extensions
-
-	// Print the fields to be stored for debugging purposes
-	fmt.Printf("<%s, %s, %t, %s, %+v>\n", domain, ipAddress, success, recordID, certificate)
-
-	// Store the parsed result along with the complete raw output into MongoDB
-	_, err := zgrabCollection.InsertOne(context.Background(), map[string]interface{}{
-		"domain":     domain,
-		"ip_address": ipAddress,
-		"certificate": map[string]interface{}{
-			"raw": certificate.Raw,
-			"parsed": map[string]interface{}{
-				"version":             certificate.Parsed.Version,
-				"serial_number":       certificate.Parsed.SerialNumber,
-				"signature_algorithm": certificate.Parsed.SignatureAlgorithm,
-				"issuer":              certificate.Parsed.Issuer,
-				"validity":            certificate.Parsed.Validity,
-				"subject":             certificate.Parsed.Subject,
-				"fingerprints":        certificate.Parsed.Fingerprints,
-			},
-			"extensions": map[string]interface{}{
-				"key_usage":         extensions.KeyUsage,
-				"basic_constraints": extensions.BasicConstraints,
-				"subject_alt_name":  extensions.SubjectAltName,
-				"authority_key_id":  extensions.AuthorityKeyID,
-				"subject_key_id":    extensions.SubjectKeyID,
-			},
-		},
-		"record_id": recordID,
-		"raw_data":  rawOutput, // Store the entire raw output in a separate field called "raw_data"
-	})
+// Store ZGrab2 SSL certificate result in MongoDB
+func storeZGrabResult(domain, ipAddress string, ssl bool, rawOutput, recordID string) {
+	// MongoDB connection setup
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	client, err := mongo.Connect(context.Background(), clientOptions)
 	if err != nil {
-		log.Printf("Failed to insert ZGrab2 result into MongoDB: %s", err)
+		log.Fatalf("Failed to connect to MongoDB: %v", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	collection := client.Database("ssl_project").Collection("zgrab2_results")
+
+	// Clean up rawOutput for JSON parsing
+	cleanedOutput := strings.ReplaceAll(rawOutput, "\\\"", "\"")
+	cleanedOutput = strings.ReplaceAll(cleanedOutput, "\\n", "")
+
+	// Parse JSON into a generic map
+	var parsedData map[string]interface{}
+	if err := json.Unmarshal([]byte(cleanedOutput), &parsedData); err != nil {
+		log.Printf("Failed to unmarshal raw JSON data for domain %s: %v", domain, err)
+		return
+	}
+
+	// Create MongoDB document according to the JSON format provided
+	document := CertificateDocument{
+		IP:     ipAddress,
+		Domain: domain,
+		Metadata: map[string]interface{}{
+			"scan_after": "",
+			"cert_sha1":  "",
+			"cert_type":  "",
+		},
+		Data:     parsedData["data"].(map[string]interface{}),
+		Raw:      rawOutput,
+		RecordID: recordID,
+	}
+
+	// Insert the document into MongoDB
+	_, err = collection.InsertOne(context.Background(), document)
+	if err != nil {
+		log.Printf("Failed to insert ZGrab2 SSL certificate result into MongoDB for domain %s: %v", domain, err)
+	} else {
+		log.Printf("Successfully inserted data for domain %s", domain)
 	}
 }
 
