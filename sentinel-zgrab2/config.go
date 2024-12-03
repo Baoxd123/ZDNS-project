@@ -1,6 +1,7 @@
 package zgrab2
 
 import (
+	"flag"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ type Config struct {
 	ConnectionsPerHost int             `long:"connections-per-host" default:"1" description:"Number of times to connect to each host (results in more output)"`
 	ReadLimitPerHost   int             `long:"read-limit-per-host" default:"96" description:"Maximum total kilobytes to read for a single host (default 96kb)"`
 	Prometheus         string          `long:"prometheus" description:"Address to use for Prometheus server (e.g. localhost:8080). If empty, Prometheus is disabled."`
+	LocalAddrStr       string          `long:"local-addr" description:"Local source address for outgoing connections (e.g. 192.168.10.2:0, port is required even if it's 0)"`
 	Multiple           MultipleCommand `command:"multiple" description:"Multiple module actions"`
 	inputFile          *os.File
 	outputFile         *os.File
@@ -54,6 +56,27 @@ func init() {
 }
 
 var config Config
+
+func parseFlags() {
+	flag.StringVar(&config.OutputFileName, "output-file", "-", "Output filename, use - for stdout")
+	flag.StringVar(&config.InputFileName, "input-file", "-", "Input filename, use - for stdin")
+	flag.StringVar(&config.MetaFileName, "metadata-file", "-", "Metadata filename, use - for stderr")
+	flag.StringVar(&config.LogFileName, "log-file", "-", "Log filename, use - for stderr")
+	flag.IntVar(&config.Senders, "senders", 1000, "Number of send goroutines to use")
+	flag.BoolVar(&config.Debug, "debug", false, "Include debug fields in the output")
+	flag.BoolVar(&config.Flush, "flush", false, "Flush after each line of output")
+	flag.BoolVar(&config.NSQMode, "nsq-mode", false, "Use NSQ Input")
+	flag.StringVar(&config.NSQOutputTopic, "nsq-output-topic", "zgrab_results", "Set NSQ output topic name")
+	flag.StringVar(&config.NSQInputTopic, "nsq-input-topic", "zgrab", "Set NSQ input topic name")
+	flag.StringVar(&config.NSQHost, "nsq-host", "localhost", "IP address of machine running nslookupd")
+	flag.IntVar(&config.GOMAXPROCS, "gomaxprocs", 0, "Set GOMAXPROCS")
+	flag.IntVar(&config.ConnectionsPerHost, "connections-per-host", 1, "Number of times to connect to each host (results in more output)")
+	flag.IntVar(&config.ReadLimitPerHost, "read-limit-per-host", 96, "Maximum total kilobytes to read for a single host (default 96kb)")
+	flag.StringVar(&config.Prometheus, "prometheus", "", "Address to use for Prometheus server (e.g. localhost:8080). If empty, Prometheus is disabled.")
+	flag.StringVar(&config.LocalAddrStr, "local-addr", "", "Local source address for outgoing connections (e.g. 192.168.10.2:0, port is required even if it's 0)")
+
+	flag.Parse()
+}
 
 func validateFrameworkConfiguration() {
 	// validate files
@@ -109,7 +132,16 @@ func validateFrameworkConfiguration() {
 	}
 	runtime.GOMAXPROCS(config.GOMAXPROCS)
 
-	//validate/start prometheus
+	// Parse and validate the local address if specified
+	if config.LocalAddrStr != "" {
+		var err error
+		config.localAddr, err = net.ResolveTCPAddr("tcp", config.LocalAddrStr)
+		if err != nil {
+			log.Fatalf("could not resolve local address %s: %v", config.LocalAddrStr, err)
+		}
+	}
+
+	// validate/start prometheus
 	if config.Prometheus != "" {
 		go func() {
 			http.Handle("metrics", promhttp.Handler())
@@ -147,4 +179,12 @@ func GetMetaFile() *os.File {
 
 func includeDebugOutput() bool {
 	return config.Debug
+}
+
+func main() {
+	// Parse command line flags
+	parseFlags()
+
+	// Validate configuration
+	validateFrameworkConfiguration()
 }
